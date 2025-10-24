@@ -17,6 +17,9 @@ from dotenv import load_dotenv
 import logging
 import base64
 
+# Import tenant lookup module for Service vs Enquiry categorization
+from tenant_lookup import get_tenant_lookup
+
 # Load environment variables
 load_dotenv()
 
@@ -129,18 +132,28 @@ class ExotelAnalytics:
             return []
 
     def process_analytics(self, calls, exophone_filter=None):
-        """Process call data into analytics"""
+        """Process call data into analytics with Service/Enquiry categorization"""
         if not calls:
             return None
 
         try:
             df = pd.DataFrame(calls)
 
-            # Filter by exophone number if specified
-            if exophone_filter and 'PhoneNumber' in df.columns:
+            # Filter by exophone number if specified (handle multiple formats)
+            if exophone_filter and ('PhoneNumber' in df.columns or 'To' in df.columns):
                 logger.info(f"Filtering calls for exophone: {exophone_filter}")
                 initial_count = len(df)
-                df = df[df['PhoneNumber'] == exophone_filter]
+
+                # Extract last 10 digits for flexible matching (8047361499)
+                filter_digits = ''.join(filter(str.isdigit, exophone_filter))[-10:]
+
+                # Filter by PhoneNumber or To field containing the exophone digits
+                def matches_exophone(row):
+                    phone_num = str(row.get('PhoneNumber', ''))
+                    to_num = str(row.get('To', ''))
+                    return filter_digits in phone_num or filter_digits in to_num
+
+                df = df[df.apply(matches_exophone, axis=1)]
                 logger.info(f"Filtered from {initial_count} to {len(df)} calls for exophone {exophone_filter}")
 
             if len(df) == 0:
@@ -152,6 +165,42 @@ class ExotelAnalytics:
                 df['DateCreated'] = pd.to_datetime(df['DateCreated'])
                 df['Date'] = df['DateCreated'].dt.date
                 df['Hour'] = df['DateCreated'].dt.hour
+
+            # ==================== NEW: Service vs Enquiry Categorization ====================
+            # Get tenant lookup instance
+            tenant_lookup = get_tenant_lookup()
+
+            # Categorize incoming calls as Service or Enquiry
+            if 'Direction' in df.columns and 'From' in df.columns:
+                # Filter only incoming calls
+                incoming_df = df[df['Direction'] == 'inbound'].copy()
+
+                if len(incoming_df) > 0:
+                    # Get unique phone numbers
+                    phone_numbers = incoming_df['From'].unique().tolist()
+
+                    # Batch lookup (more efficient than one-by-one)
+                    lookup_results = tenant_lookup.batch_lookup(phone_numbers)
+
+                    # Map results back to dataframe
+                    def categorize_call(phone):
+                        is_tenant, call_type, info = lookup_results.get(phone, (False, 'enquiry', None))
+                        return call_type
+
+                    incoming_df['call_category'] = incoming_df['From'].apply(categorize_call)
+
+                    # Merge back into main dataframe
+                    df = df.merge(incoming_df[['Sid', 'call_category']], on='Sid', how='left')
+
+                    # Fill non-incoming calls with 'outgoing'
+                    df['call_category'] = df['call_category'].fillna('outgoing')
+
+                    logger.info(f"Categorized {len(incoming_df)} incoming calls")
+                else:
+                    df['call_category'] = 'outgoing'
+            else:
+                df['call_category'] = 'unknown'
+            # ==================== END Categorization ====================
 
             # Calculate metrics
             # Note: Exotel API returns Direction as 'inbound', 'outbound-api', 'outbound-dial'
@@ -165,8 +214,21 @@ class ExotelAnalytics:
                 'daily_calls': df.groupby('Date').size().to_dict() if 'Date' in df.columns else {},
                 'hourly_calls': df.groupby('Hour').size().to_dict() if 'Hour' in df.columns else {},
                 'status_breakdown': df['Status'].value_counts().to_dict() if 'Status' in df.columns else {},
-                'direction_breakdown': df['Direction'].value_counts().to_dict() if 'Direction' in df.columns else {}
+                'direction_breakdown': df['Direction'].value_counts().to_dict() if 'Direction' in df.columns else {},
+
+                # ==================== NEW: Service vs Enquiry Metrics ====================
+                'service_calls': len(df[df['call_category'] == 'service']) if 'call_category' in df.columns else 0,
+                'enquiry_calls': len(df[df['call_category'] == 'enquiry']) if 'call_category' in df.columns else 0,
+                'service_percentage': 0,
+                'enquiry_percentage': 0,
+                'category_breakdown': df['call_category'].value_counts().to_dict() if 'call_category' in df.columns else {}
+                # ==================== END New Metrics ====================
             }
+
+            # Calculate percentages
+            if analytics['incoming_calls'] > 0:
+                analytics['service_percentage'] = round((analytics['service_calls'] / analytics['incoming_calls']) * 100, 1)
+                analytics['enquiry_percentage'] = round((analytics['enquiry_calls'] / analytics['incoming_calls']) * 100, 1)
 
             # Convert date objects to strings for JSON serialization
             if analytics['daily_calls']:
@@ -177,6 +239,51 @@ class ExotelAnalytics:
         except Exception as e:
             logger.error(f"Error processing analytics: {str(e)}")
             return None
+
+
+def calculate_comparison(current_analytics, previous_analytics):
+    """
+    Calculate comparison metrics between two periods
+    Returns dict with changes and percentages
+    """
+    comparison = {
+        'total_calls_change': 0,
+        'incoming_calls_change': 0,
+        'service_calls_change': 0,
+        'enquiry_calls_change': 0,
+        'total_calls_pct': 0,
+        'incoming_calls_pct': 0,
+        'service_calls_pct': 0,
+        'enquiry_calls_pct': 0
+    }
+
+    if not previous_analytics or not current_analytics:
+        return comparison
+
+    try:
+        # Calculate absolute changes
+        comparison['total_calls_change'] = current_analytics.get('total_calls', 0) - previous_analytics.get('total_calls', 0)
+        comparison['incoming_calls_change'] = current_analytics.get('incoming_calls', 0) - previous_analytics.get('incoming_calls', 0)
+        comparison['service_calls_change'] = current_analytics.get('service_calls', 0) - previous_analytics.get('service_calls', 0)
+        comparison['enquiry_calls_change'] = current_analytics.get('enquiry_calls', 0) - previous_analytics.get('enquiry_calls', 0)
+
+        # Calculate percentage changes
+        if previous_analytics.get('total_calls', 0) > 0:
+            comparison['total_calls_pct'] = round((comparison['total_calls_change'] / previous_analytics['total_calls']) * 100, 1)
+
+        if previous_analytics.get('incoming_calls', 0) > 0:
+            comparison['incoming_calls_pct'] = round((comparison['incoming_calls_change'] / previous_analytics['incoming_calls']) * 100, 1)
+
+        if previous_analytics.get('service_calls', 0) > 0:
+            comparison['service_calls_pct'] = round((comparison['service_calls_change'] / previous_analytics['service_calls']) * 100, 1)
+
+        if previous_analytics.get('enquiry_calls', 0) > 0:
+            comparison['enquiry_calls_pct'] = round((comparison['enquiry_calls_change'] / previous_analytics['enquiry_calls']) * 100, 1)
+
+    except Exception as e:
+        logger.error(f"Error calculating comparison: {e}")
+
+    return comparison
 
 
 def generate_charts(analytics):
@@ -242,6 +349,33 @@ def generate_charts(analytics):
                 template='plotly_white'
             )
             charts['hourly'] = json.dumps(fig4, cls=plotly.utils.PlotlyJSONEncoder)
+
+        # ==================== NEW: Service vs Enquiry Chart ====================
+        # Service vs Enquiry pie chart (for incoming calls only)
+        if analytics.get('service_calls', 0) > 0 or analytics.get('enquiry_calls', 0) > 0:
+            labels = []
+            values = []
+            colors = []
+
+            if analytics.get('service_calls', 0) > 0:
+                labels.append(f"Service Calls ({analytics['service_percentage']}%)")
+                values.append(analytics['service_calls'])
+                colors.append('#4CAF50')  # Green
+
+            if analytics.get('enquiry_calls', 0) > 0:
+                labels.append(f"Enquiry Calls ({analytics['enquiry_percentage']}%)")
+                values.append(analytics['enquiry_calls'])
+                colors.append('#FF9800')  # Orange
+
+            fig5 = go.Figure(data=[
+                go.Pie(labels=labels, values=values, marker=dict(colors=colors))
+            ])
+            fig5.update_layout(
+                title='Service vs Enquiry Calls (Incoming Only)',
+                template='plotly_white'
+            )
+            charts['service_enquiry'] = json.dumps(fig5, cls=plotly.utils.PlotlyJSONEncoder)
+        # ==================== END Service vs Enquiry Chart ====================
 
         return charts
 
@@ -570,6 +704,20 @@ def send_scheduled_email_via_infobip(analytics, start_date, end_date):
                             <div class="metric-label">Avg Duration</div>
                         </div>
                     </div>
+
+                    <h2 style="color: #667eea; margin: 30px 0 20px 0;">📊 Call Categorization</h2>
+                    <div class="metrics">
+                        <div class="metric-card" style="background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);">
+                            <div class="metric-value" style="color: #4CAF50;">🔧 {analytics.get('service_calls', 0)}</div>
+                            <div class="metric-label">Service Calls ({analytics.get('service_percentage', 0)}%)</div>
+                            <div style="font-size: 11px; color: #666; margin-top: 5px;">Existing tenants</div>
+                        </div>
+                        <div class="metric-card" style="background: linear-gradient(135deg, #fff3cd 0%, #ffe9a3 100%);">
+                            <div class="metric-value" style="color: #FF9800;">💡 {analytics.get('enquiry_calls', 0)}</div>
+                            <div class="metric-label">Enquiry Calls ({analytics.get('enquiry_percentage', 0)}%)</div>
+                            <div style="font-size: 11px; color: #666; margin-top: 5px;">New prospects!</div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="footer">
@@ -842,6 +990,76 @@ def send_email_infobip():
 
     except Exception as e:
         logger.error(f"Error in send_email_infobip: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/analytics-comparison', methods=['POST'])
+def get_analytics_comparison():
+    """Get analytics with week-over-week or month-over-month comparison"""
+    try:
+        data = request.json
+        start_date = data.get('start_date')
+        end_date = data.get('end_date')
+        comparison_type = data.get('comparison_type', 'week')  # 'week' or 'month'
+
+        if not start_date or not end_date:
+            return jsonify({'error': 'Start date and end date required'}), 400
+
+        # Create ExotelAnalytics instance
+        exotel = ExotelAnalytics(
+            config['exotel_api_key'],
+            config['exotel_api_token'],
+            config['exotel_sid'],
+            config['exotel_account_sid']
+        )
+
+        # Get current period analytics
+        current_calls = exotel.fetch_calls(start_date, end_date)
+        exophone_filter = config.get('exophone_number')
+        current_analytics = exotel.process_analytics(current_calls, exophone_filter=exophone_filter)
+
+        if not current_analytics:
+            return jsonify({'error': 'No data available for current period'}), 404
+
+        # Calculate previous period dates
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+        period_days = (end_dt - start_dt).days + 1
+
+        if comparison_type == 'week':
+            prev_start = (start_dt - timedelta(days=7)).strftime('%Y-%m-%d')
+            prev_end = (end_dt - timedelta(days=7)).strftime('%Y-%m-%d')
+            comparison_label = 'Week-over-Week'
+        else:  # month
+            prev_start = (start_dt - timedelta(days=30)).strftime('%Y-%m-%d')
+            prev_end = (end_dt - timedelta(days=30)).strftime('%Y-%m-%d')
+            comparison_label = 'Month-over-Month'
+
+        # Get previous period analytics
+        previous_calls = exotel.fetch_calls(prev_start, prev_end)
+        previous_analytics = exotel.process_analytics(previous_calls, exophone_filter=exophone_filter)
+
+        # Calculate comparison
+        comparison = calculate_comparison(current_analytics, previous_analytics)
+
+        return jsonify({
+            'success': True,
+            'current_period': {
+                'start_date': start_date,
+                'end_date': end_date,
+                'analytics': current_analytics
+            },
+            'previous_period': {
+                'start_date': prev_start,
+                'end_date': prev_end,
+                'analytics': previous_analytics
+            },
+            'comparison': comparison,
+            'comparison_type': comparison_label
+        })
+
+    except Exception as e:
+        logger.error(f"Error in get_analytics_comparison: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 

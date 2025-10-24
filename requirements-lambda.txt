@@ -1,0 +1,12 @@
+# AWS Lambda Requirements
+# Minimal dependencies for scheduled email reports
+
+requests==2.31.0
+pandas==2.1.4
+pytz==2024.1
+python-dotenv==1.0.0
+psycopg2-binary==2.9.9
+
+# Note: Lambda already includes boto3, so no need to package it
+# psycopg2-binary is needed for PostgreSQL database connection (tenant lookup)
+# Total package size should be under 50MB (unzipped) for Lambda
